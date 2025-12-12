@@ -1,0 +1,25 @@
+[project]
+name = 'stacks-decentralized-exchange-app'
+description = ''
+authors = []
+telemetry = true
+cache_dir = './.cache'
+requirements = []
+[contracts.stacks-decentralized-exchange]
+path = 'contracts/stacks-decentralized-exchange.clar'
+clarity_version = 4
+epoch = 'latest'
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.lints]
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
+
+[repl.remote_data]
+enabled = false
+api_url = 'https://api.hiro.so'
