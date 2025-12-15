@@ -46,6 +46,16 @@
 (define-constant ERR-SAME-TOKEN (err u117))
 (define-constant MAX-PRICE-IMPACT u1000) ;; 10% max price impact in basis points
 
+;; Error constants for enhanced insufficient liquidity handling
+(define-constant ERR-POOL-EMPTY (err u122))
+(define-constant ERR-RESERVE-TOO-LOW (err u123))
+(define-constant ERR-OUTPUT-EXCEEDS-RESERVE (err u124))
+(define-constant ERR-BELOW-MIN-LIQUIDITY (err u125))
+
+;; Minimum liquidity thresholds to prevent dust attacks
+(define-constant MIN-INITIAL-LIQUIDITY u1000)
+(define-constant MIN-RESERVE-THRESHOLD u100)
+
 ;; Approved contract hashes for trusted token contracts
 (define-map approved-contract-hashes (buff 32) bool)
 
@@ -252,10 +262,18 @@
     
     (asserts! (>= provider-lp-balance lp-tokens) ERR-INSUFFICIENT-LP-TOKENS)
     
+    ;; Enhanced insufficient liquidity checks
+    (asserts! (> liquidity-total u0) ERR-POOL-EMPTY)
     (asserts! (>= liquidity-total lp-tokens) ERR-INSUFFICIENT-LIQUIDITY)
     
     (asserts! (> amount-a-out u0) ERR-INVALID-AMOUNT)
     (asserts! (> amount-b-out u0) ERR-INVALID-AMOUNT)
+    
+    ;; Check minimum reserves after withdrawal (prevent complete drainage)
+    (asserts! (or (is-eq lp-tokens liquidity-total) 
+                  (and (>= (- reserve-a amount-a-out) MIN-RESERVE-THRESHOLD)
+                       (>= (- reserve-b amount-b-out) MIN-RESERVE-THRESHOLD)))
+              ERR-BELOW-MIN-LIQUIDITY)
     
     (asserts! (>= amount-a-out min-amount-a) ERR-MIN-OUTPUT-NOT-MET)
     (asserts! (>= amount-b-out min-amount-b) ERR-MIN-OUTPUT-NOT-MET)
@@ -506,7 +524,12 @@
     
     (asserts! (or is-token-a is-token-b) ERR-INVALID-TOKEN)
     
-    (asserts! (> reserve-out amount-out) ERR-INSUFFICIENT-LIQUIDITY)
+    ;; Enhanced insufficient liquidity checks
+    (asserts! (> (get liquidity-total pool) u0) ERR-POOL-EMPTY)
+    (asserts! (>= reserve-in MIN-RESERVE-THRESHOLD) ERR-RESERVE-TOO-LOW)
+    (asserts! (>= reserve-out MIN-RESERVE-THRESHOLD) ERR-RESERVE-TOO-LOW)
+    (asserts! (> reserve-out amount-out) ERR-OUTPUT-EXCEEDS-RESERVE)
+    (asserts! (>= new-reserve-out MIN-RESERVE-THRESHOLD) ERR-BELOW-MIN-LIQUIDITY)
     (asserts! (> amount-out u0) ERR-INVALID-AMOUNT)
     
     (asserts! (>= amount-out min-amount-out) ERR-MIN-OUTPUT-NOT-MET)
@@ -687,6 +710,53 @@
 
 (define-read-only (get-pool (pool-id uint))
   (map-get? pools pool-id)
+)
+
+;; Check liquidity status for a pool with detailed diagnostics
+(define-read-only (check-liquidity-status (pool-id uint))
+  (let
+    (
+      (pool (map-get? pools pool-id))
+    )
+    (match pool
+      pool-data 
+        (let
+          (
+            (reserve-a (get reserve-a pool-data))
+            (reserve-b (get reserve-b pool-data))
+            (liquidity-total (get liquidity-total pool-data))
+            (is-empty (is-eq liquidity-total u0))
+            (reserve-a-low (< reserve-a MIN-RESERVE-THRESHOLD))
+            (reserve-b-low (< reserve-b MIN-RESERVE-THRESHOLD))
+            (is-tradeable (and (not is-empty) 
+                               (not reserve-a-low) 
+                               (not reserve-b-low)))
+          )
+          (ok {
+            pool-exists: true,
+            is-empty: is-empty,
+            reserve-a: reserve-a,
+            reserve-b: reserve-b,
+            liquidity-total: liquidity-total,
+            reserve-a-below-threshold: reserve-a-low,
+            reserve-b-below-threshold: reserve-b-low,
+            is-tradeable: is-tradeable,
+            min-reserve-threshold: MIN-RESERVE-THRESHOLD
+          })
+        )
+      (ok {
+        pool-exists: false,
+        is-empty: true,
+        reserve-a: u0,
+        reserve-b: u0,
+        liquidity-total: u0,
+        reserve-a-below-threshold: true,
+        reserve-b-below-threshold: true,
+        is-tradeable: false,
+        min-reserve-threshold: MIN-RESERVE-THRESHOLD
+      })
+    )
+  )
 )
 
 (define-read-only (get-liquidity (pool-id uint) (provider principal))
