@@ -37,6 +37,14 @@
 (define-constant FEE-PERCENT u30) ;; 0.3% fee in basis points
 (define-constant REWARD_RATE u10) ;; Rewards per second per liquidity unit
 
+;; Error constants for swap operations
+(define-constant ERR-SWAP-EXPIRED (err u113))
+(define-constant ERR-INVALID-TOKEN (err u114))
+(define-constant ERR-PRICE-IMPACT-TOO-HIGH (err u115))
+(define-constant ERR-K-INVARIANT-VIOLATED (err u116))
+(define-constant ERR-SAME-TOKEN (err u117))
+(define-constant MAX-PRICE-IMPACT u1000) ;; 10% max price impact in basis points
+
 ;; Approved contract hashes for trusted token contracts
 (define-map approved-contract-hashes (buff 32) bool)
 
@@ -210,22 +218,168 @@
   )
 )
 
-;; Swap tokens using AMM (simplified without trait call for clarity check)
-(define-public (swap (pool-id uint) (token-in-contract principal) (amount-in uint) (min-amount-out uint))
+
+;; Swap history tracking for analytics
+(define-map swap-history {swap-id: uint} {
+  trader: principal,
+  pool-id: uint,
+  token-in: principal,
+  token-out: principal,
+  amount-in: uint,
+  amount-out: uint,
+  fee-paid: uint,
+  timestamp: uint
+})
+(define-data-var last-swap-id uint u0)
+
+;; Calculate output amount for a swap (read-only helper)
+(define-read-only (get-swap-output (pool-id uint) (token-in-contract principal) (amount-in uint))
   (let
     (
-      (pool (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND))
-      (reserve-in (if (is-eq token-in-contract (get token-a pool)) (get reserve-a pool) (get reserve-b pool)))
-      (reserve-out (if (is-eq token-in-contract (get token-a pool)) (get reserve-b pool) (get reserve-a pool)))
+      (pool (unwrap! (map-get? pools pool-id) (err u404)))
+      (is-token-a (is-eq token-in-contract (get token-a pool)))
+      (reserve-in (if is-token-a (get reserve-a pool) (get reserve-b pool)))
+      (reserve-out (if is-token-a (get reserve-b pool) (get reserve-a pool)))
       (amount-in-with-fee (/ (* amount-in (- u10000 FEE-PERCENT)) u10000))
       (amount-out (/ (* reserve-out amount-in-with-fee) (+ reserve-in amount-in-with-fee)))
     )
-    (asserts! (>= amount-out min-amount-out) ERR-INSUFFICIENT-LIQUIDITY)
-    (map-set pools pool-id (merge pool (if (is-eq token-in-contract (get token-a pool))
-      {reserve-a: (+ (get reserve-a pool) amount-in), reserve-b: (- (get reserve-b pool) amount-out)}
-      {reserve-a: (- (get reserve-a pool) amount-out), reserve-b: (+ (get reserve-b pool) amount-in)})))
-    (var-set platform-fees (+ (var-get platform-fees) (/ (* amount-in FEE-PERCENT) u10000)))
-    (ok amount-out)
+    (ok {
+      amount-out: amount-out,
+      fee: (/ (* amount-in FEE-PERCENT) u10000),
+      price-impact: (calculate-price-impact reserve-in reserve-out amount-in)
+    })
+  )
+)
+
+;; Calculate price impact in basis points
+(define-read-only (calculate-price-impact (reserve-in uint) (reserve-out uint) (amount-in uint))
+  (let
+    (
+      (spot-price-scaled (/ (* reserve-out u10000) reserve-in))
+      (new-reserve-in (+ reserve-in amount-in))
+      (amount-in-with-fee (/ (* amount-in (- u10000 FEE-PERCENT)) u10000))
+      (amount-out (/ (* reserve-out amount-in-with-fee) (+ reserve-in amount-in-with-fee)))
+      (execution-price-scaled (/ (* amount-out u10000) amount-in))
+      (impact (if (> spot-price-scaled execution-price-scaled)
+        (/ (* (- spot-price-scaled execution-price-scaled) u10000) spot-price-scaled)
+        u0))
+    )
+    impact
+  )
+)
+
+;; swap function
+(define-public (swap-tokens 
+    (pool-id uint) 
+    (token-in-contract principal) 
+    (amount-in uint) 
+    (min-amount-out uint)
+    (deadline uint))
+  (let
+    (
+      (current-timestamp stacks-block-time)
+      (pool (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND))
+      (token-a (get token-a pool))
+      (token-b (get token-b pool))
+      (is-token-a (is-eq token-in-contract token-a))
+      (is-token-b (is-eq token-in-contract token-b))
+      (reserve-in (if is-token-a (get reserve-a pool) (get reserve-b pool)))
+      (reserve-out (if is-token-a (get reserve-b pool) (get reserve-a pool)))
+      (token-out (if is-token-a token-b token-a))
+      
+      (k-before (* (get reserve-a pool) (get reserve-b pool)))
+      
+      (fee-amount (/ (* amount-in FEE-PERCENT) u10000))
+      (amount-in-with-fee (- amount-in fee-amount))
+      
+      (amount-out (/ (* reserve-out amount-in-with-fee) (+ reserve-in amount-in-with-fee)))
+      
+      (new-reserve-in (+ reserve-in amount-in))
+      (new-reserve-out (- reserve-out amount-out))
+      
+      (k-after (* (if is-token-a new-reserve-in new-reserve-out) 
+                  (if is-token-a new-reserve-out new-reserve-in)))
+      
+      (price-impact (calculate-price-impact reserve-in reserve-out amount-in))
+      
+      (swap-id (+ (var-get last-swap-id) u1))
+    )
+    (asserts! (> amount-in u0) ERR-ZERO-AMOUNT)
+    
+    (asserts! (>= deadline current-timestamp) ERR-SWAP-EXPIRED)
+    
+    (asserts! (or is-token-a is-token-b) ERR-INVALID-TOKEN)
+    
+    (asserts! (> reserve-out amount-out) ERR-INSUFFICIENT-LIQUIDITY)
+    (asserts! (> amount-out u0) ERR-INVALID-AMOUNT)
+    
+    (asserts! (>= amount-out min-amount-out) ERR-MIN-OUTPUT-NOT-MET)
+    
+    (asserts! (<= price-impact MAX-PRICE-IMPACT) ERR-PRICE-IMPACT-TOO-HIGH)
+    
+    (asserts! (>= k-after k-before) ERR-K-INVARIANT-VIOLATED)
+    
+    (map-set pools pool-id (merge pool 
+      (if is-token-a
+        {reserve-a: new-reserve-in, reserve-b: new-reserve-out}
+        {reserve-a: new-reserve-out, reserve-b: new-reserve-in})))
+    
+    (var-set platform-fees (+ (var-get platform-fees) fee-amount))
+    
+    (map-set swap-history {swap-id: swap-id} {
+      trader: tx-sender,
+      pool-id: pool-id,
+      token-in: token-in-contract,
+      token-out: token-out,
+      amount-in: amount-in,
+      amount-out: amount-out,
+      fee-paid: fee-amount,
+      timestamp: current-timestamp
+    })
+    (var-set last-swap-id swap-id)
+    
+    ;; Return swap details
+    (ok {
+      amount-out: amount-out,
+      fee-paid: fee-amount,
+      price-impact: price-impact,
+      swap-id: swap-id,
+      executed-at: current-timestamp
+    })
+  )
+)
+
+;; Legacy swap function
+(define-public (swap (pool-id uint) (token-in-contract principal) (amount-in uint) (min-amount-out uint))
+  (swap-tokens pool-id token-in-contract amount-in min-amount-out (+ stacks-block-time u86400))
+)
+
+;; Get swap history by ID
+(define-read-only (get-swap-history (swap-id uint))
+  (map-get? swap-history {swap-id: swap-id})
+)
+
+;; Get last swap ID
+(define-read-only (get-last-swap-id)
+  (var-get last-swap-id)
+)
+
+;; Generate swap receipt
+(define-read-only (get-swap-receipt (swap-id uint))
+  (let
+    (
+      (swap-record (unwrap! (map-get? swap-history {swap-id: swap-id}) (err u404)))
+    )
+    (ok {
+      swap-id: swap-id,
+      trader-address: (to-ascii? (get trader swap-record)),
+      token-in-address: (to-ascii? (get token-in swap-record)),
+      token-out-address: (to-ascii? (get token-out swap-record)),
+      amount-in: (get amount-in swap-record),
+      amount-out: (get amount-out swap-record),
+      fee-paid: (get fee-paid swap-record),
+      timestamp: (get timestamp swap-record)
+    })
   )
 )
 
@@ -233,7 +387,6 @@
 (define-public (claim-rewards (pool-id uint))
   (let
     (
-      ;; CLARITY 4: stacks-block-time - Use real timestamp for yield accrual
       (current-timestamp stacks-block-time)
       (liquidity (default-to u0 (map-get? liquidity-providers {pool-id: pool-id, provider: tx-sender})))
       (reward-info (default-to {last-claim: u0, accrued: u0} (map-get? rewards {pool-id: pool-id, provider: tx-sender})))
@@ -260,7 +413,6 @@
 (define-read-only (is-contract-approved (contract-principal principal))
   (let
     (
-      ;; CLARITY 4: contract-hash? - Get SHA-512/256 hash of contract code
       (hash-result (contract-hash? contract-principal))
     )
     ;; match on result type: (match result ok-name ok-expr err-name err-expr)
@@ -275,7 +427,6 @@
 (define-public (verified-swap (pool-id uint) (token-in-contract principal) (amount-in uint) (min-amount-out uint))
   (let
     (
-      ;; CLARITY 4: Verify the token contract hash before proceeding
       (is-approved (is-contract-approved token-in-contract))
     )
     (asserts! is-approved ERR-INVALID-CONTRACT-HASH)
@@ -290,7 +441,6 @@
     (
       (pool (unwrap! (map-get? pools pool-id) (err u404)))
     )
-    ;; CLARITY 4: to-ascii? - Convert principal to ASCII string
     (ok {
       pool-id: pool-id,
       token-a-string: (to-ascii? (get token-a pool)),
