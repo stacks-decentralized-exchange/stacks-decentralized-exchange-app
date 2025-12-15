@@ -312,14 +312,11 @@
       ;; Calculate lock expiry
       (lock-expiry (+ current-timestamp lock-period))
     )
-    ;; CHECK 1: Amounts must be greater than zero
     (asserts! (> amount-a u0) ERR-ZERO-AMOUNT)
     (asserts! (> amount-b u0) ERR-ZERO-AMOUNT)
     
-    ;; CHECK 2: Lock period must be at least minimum
     (asserts! (>= lock-period MIN-LOCK-PERIOD) ERR-INVALID-AMOUNT)
     
-    ;; CHECK 3: Pool ratio check (only for non-empty pools)
     (asserts! (or 
       (is-eq liquidity-total u0)
       (and
@@ -327,10 +324,8 @@
         (<= provided-ratio-scaled (+ expected-ratio-scaled RATIO_TOLERANCE))))
       ERR-RATIO-MISMATCH)
     
-    ;; CHECK 4: Slippage protection - ensure minimum LP tokens
     (asserts! (>= liquidity-tokens min-liquidity) ERR-SLIPPAGE-TOO-HIGH)
     
-    ;; CHECK 5: Ensure liquidity tokens calculated is valid
     (asserts! (> liquidity-tokens u0) ERR-INVALID-AMOUNT)
     
     ;; Update pool reserves
