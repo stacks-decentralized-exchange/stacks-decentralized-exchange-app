@@ -65,6 +65,75 @@
 (define-map liquidity-providers {pool-id: uint, provider: principal} uint)
 (define-map rewards {pool-id: uint, provider: principal} {last-claim: uint, accrued: uint})
 
+;; Error constants for time-based operations
+(define-constant ERR-BLOCK-NOT-FOUND (err u118))
+(define-constant ERR-TIME-LOCK-ACTIVE (err u119))
+(define-constant ERR-INVALID-BLOCK-HEIGHT (err u120))
+(define-constant ERR-POOL-TOO-NEW (err u121))
+
+;; Time-lock configuration for liquidity
+(define-constant MIN-LOCK-PERIOD u3600) ;; 1 hour minimum lock
+(define-constant POOL-MATURITY-PERIOD u86400) ;; 24 hours before pool is considered mature
+
+;; Time-lock tracking for liquidity providers
+(define-map liquidity-time-locks {pool-id: uint, provider: principal} {
+  locked-until: uint,
+  lock-block-height: uint
+})
+
+;; Get block timestamp by height
+(define-read-only (get-block-timestamp (target-block-height uint))
+  (match (get-stacks-block-info? time target-block-height)
+    timestamp (ok timestamp)
+    ERR-BLOCK-NOT-FOUND
+  )
+)
+
+;; Get current block height
+(define-read-only (get-current-block-height)
+  stacks-block-height
+)
+
+;; Calculate time elapsed since a specific block
+(define-read-only (get-time-since-block (target-block-height uint))
+  (let
+    (
+      (current-time stacks-block-time)
+      (block-time-result (get-stacks-block-info? time target-block-height))
+    )
+    (match block-time-result
+      past-block-time (ok (- current-time past-block-time))
+      ERR-BLOCK-NOT-FOUND
+    )
+  )
+)
+
+;; Check if a pool has reached maturity (24 hours old)
+(define-read-only (is-pool-mature (pool-id uint))
+  (let
+    (
+      (pool (map-get? pools pool-id))
+    )
+    (match pool
+      pool-data (>= (- stacks-block-time (get created-at pool-data)) POOL-MATURITY-PERIOD)
+      false
+    )
+  )
+)
+
+;; Get pool age in seconds
+(define-read-only (get-pool-age (pool-id uint))
+  (let
+    (
+      (pool (map-get? pools pool-id))
+    )
+    (match pool
+      pool-data (ok (- stacks-block-time (get created-at pool-data)))
+      ERR-POOL-NOT-FOUND
+    )
+  )
+)
+
 
 ;; Create a new liquidity pool with timestamp tracking
 (define-public (create-pool (token-a-contract principal) (token-b-contract principal) (amount-a uint) (amount-b uint))
@@ -163,6 +232,11 @@
       (current-timestamp stacks-block-time)
       ;; Get provider's LP token balance
       (provider-lp-balance (default-to u0 (map-get? liquidity-providers {pool-id: pool-id, provider: tx-sender})))
+      ;; Check time lock status (Clarity 4: stacks-block-time for time checks)
+      (time-lock (map-get? liquidity-time-locks {pool-id: pool-id, provider: tx-sender}))
+      (is-locked (match time-lock
+        lock-data (< current-timestamp (get locked-until lock-data))
+        false))
       ;; Calculate proportional amounts to return
       (amount-a-out (/ (* lp-tokens reserve-a) liquidity-total))
       (amount-b-out (/ (* lp-tokens reserve-b) liquidity-total))
@@ -171,6 +245,9 @@
       (seconds-since-claim (- current-timestamp (get last-claim reward-info)))
       (pending-rewards (+ (get accrued reward-info) (* provider-lp-balance (* REWARD_RATE seconds-since-claim))))
     )
+    ;; CHECK: Time lock must not be active
+    (asserts! (not is-locked) ERR-TIME-LOCK-ACTIVE)
+    
     (asserts! (> lp-tokens u0) ERR-ZERO-AMOUNT)
     
     (asserts! (>= provider-lp-balance lp-tokens) ERR-INSUFFICIENT-LP-TOKENS)
@@ -194,6 +271,11 @@
     (map-set liquidity-providers {pool-id: pool-id, provider: tx-sender} 
       (- provider-lp-balance lp-tokens))
     
+    ;; Clear time lock if fully withdrawn
+    (if (is-eq (- provider-lp-balance lp-tokens) u0)
+      (map-delete liquidity-time-locks {pool-id: pool-id, provider: tx-sender})
+      true)
+    
     ;; Reset rewards tracking (rewards should be claimed before removal)
     (map-set rewards {pool-id: pool-id, provider: tx-sender} {last-claim: current-timestamp, accrued: u0})
     
@@ -203,6 +285,137 @@
       lp-tokens-burned: lp-tokens,
       pending-rewards: pending-rewards
     })
+  )
+)
+
+;; Add liquidity with time lock for enhanced rewards (Clarity 4: stacks-block-time)
+(define-public (add-liquidity-with-lock (pool-id uint) (amount-a uint) (amount-b uint) (min-liquidity uint) (lock-period uint))
+  (let
+    (
+      (pool (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND))
+      (reserve-a (get reserve-a pool))
+      (reserve-b (get reserve-b pool))
+      (liquidity-total (get liquidity-total pool))
+      (current-timestamp stacks-block-time)
+      (current-block stacks-block-height)
+      ;; Calculate expected ratio (scaled by 10000 for precision)
+      (expected-ratio-scaled (if (> reserve-a u0) (/ (* reserve-b u10000) reserve-a) u0))
+      (provided-ratio-scaled (if (> amount-a u0) (/ (* amount-b u10000) amount-a) u0))
+      ;; Calculate liquidity tokens to mint
+      (liquidity-tokens (if (is-eq liquidity-total u0)
+        (sqrti (* amount-a amount-b))
+        (let ((liquidity-from-a (/ (* amount-a liquidity-total) reserve-a))
+              (liquidity-from-b (/ (* amount-b liquidity-total) reserve-b)))
+          (if (< liquidity-from-a liquidity-from-b) liquidity-from-a liquidity-from-b))))
+      ;; Get existing LP balance for provider
+      (existing-lp (default-to u0 (map-get? liquidity-providers {pool-id: pool-id, provider: tx-sender})))
+      ;; Calculate lock expiry
+      (lock-expiry (+ current-timestamp lock-period))
+    )
+    ;; CHECK 1: Amounts must be greater than zero
+    (asserts! (> amount-a u0) ERR-ZERO-AMOUNT)
+    (asserts! (> amount-b u0) ERR-ZERO-AMOUNT)
+    
+    ;; CHECK 2: Lock period must be at least minimum
+    (asserts! (>= lock-period MIN-LOCK-PERIOD) ERR-INVALID-AMOUNT)
+    
+    ;; CHECK 3: Pool ratio check (only for non-empty pools)
+    (asserts! (or 
+      (is-eq liquidity-total u0)
+      (and
+        (>= provided-ratio-scaled (- expected-ratio-scaled RATIO_TOLERANCE))
+        (<= provided-ratio-scaled (+ expected-ratio-scaled RATIO_TOLERANCE))))
+      ERR-RATIO-MISMATCH)
+    
+    ;; CHECK 4: Slippage protection - ensure minimum LP tokens
+    (asserts! (>= liquidity-tokens min-liquidity) ERR-SLIPPAGE-TOO-HIGH)
+    
+    ;; CHECK 5: Ensure liquidity tokens calculated is valid
+    (asserts! (> liquidity-tokens u0) ERR-INVALID-AMOUNT)
+    
+    ;; Update pool reserves
+    (map-set pools pool-id (merge pool {
+      reserve-a: (+ reserve-a amount-a), 
+      reserve-b: (+ reserve-b amount-b), 
+      liquidity-total: (+ liquidity-total liquidity-tokens)
+    }))
+    
+    ;; Update provider's LP token balance
+    (map-set liquidity-providers {pool-id: pool-id, provider: tx-sender} 
+      (+ existing-lp liquidity-tokens))
+    
+    ;; Set time lock (Clarity 4: stacks-block-time for lock expiry)
+    (map-set liquidity-time-locks {pool-id: pool-id, provider: tx-sender} {
+      locked-until: lock-expiry,
+      lock-block-height: current-block
+    })
+    
+    ;; Update reward tracking with current timestamp
+    (map-set rewards {pool-id: pool-id, provider: tx-sender} {last-claim: current-timestamp, accrued: u0})
+    
+    (ok {
+      liquidity-tokens: liquidity-tokens, 
+      amount-a-added: amount-a, 
+      amount-b-added: amount-b,
+      locked-until: lock-expiry,
+      lock-block: current-block
+    })
+  )
+)
+
+;; Check remaining lock time for a provider
+(define-read-only (get-lock-time-remaining (pool-id uint) (provider principal))
+  (let
+    (
+      (current-timestamp stacks-block-time)
+      (time-lock (map-get? liquidity-time-locks {pool-id: pool-id, provider: provider}))
+    )
+    (match time-lock
+      lock-data 
+        (if (> (get locked-until lock-data) current-timestamp)
+          (ok {
+            is-locked: true,
+            seconds-remaining: (- (get locked-until lock-data) current-timestamp),
+            locked-until: (get locked-until lock-data),
+            lock-block-height: (get lock-block-height lock-data)
+          })
+          (ok {
+            is-locked: false,
+            seconds-remaining: u0,
+            locked-until: (get locked-until lock-data),
+            lock-block-height: (get lock-block-height lock-data)
+          }))
+      (ok {
+        is-locked: false,
+        seconds-remaining: u0,
+        locked-until: u0,
+        lock-block-height: u0
+      })
+    )
+  )
+)
+
+;; Get time lock info using historical block time (Clarity 4: get-stacks-block-info?)
+(define-read-only (get-lock-info-with-block-time (pool-id uint) (provider principal))
+  (let
+    (
+      (time-lock (map-get? liquidity-time-locks {pool-id: pool-id, provider: provider}))
+    )
+    (match time-lock
+      lock-data 
+        (let
+          (
+            (lock-block (get lock-block-height lock-data))
+            (lock-block-time (get-stacks-block-info? time lock-block))
+          )
+          (ok {
+            locked-until: (get locked-until lock-data),
+            lock-block-height: lock-block,
+            lock-block-timestamp: lock-block-time,
+            current-time: stacks-block-time
+          }))
+      ERR-POOL-NOT-FOUND
+    )
   )
 )
 
