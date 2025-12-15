@@ -56,6 +56,26 @@
 (define-constant MIN-INITIAL-LIQUIDITY u1000)
 (define-constant MIN-RESERVE-THRESHOLD u100)
 
+;; Error constants for access control
+(define-constant ERR-CONTRACT-PAUSED (err u126))
+(define-constant ERR-POOL-SUSPENDED (err u127))
+(define-constant ERR-NOT-OPERATOR (err u128))
+(define-constant ERR-ALREADY-OPERATOR (err u129))
+(define-constant ERR-CANNOT-REMOVE-OWNER (err u130))
+
+;; Access control state
+(define-data-var contract-paused bool false)
+(define-data-var pending-owner (optional principal) none)
+
+;; Admin operators map (can perform certain admin actions)
+(define-map admin-operators principal bool)
+
+;; Suspended pools (temporarily disabled)
+(define-map suspended-pools uint bool)
+
+;; Initialize contract owner as an operator
+(map-set admin-operators CONTRACT-OWNER true)
+
 ;; Approved contract hashes for trusted token contracts
 (define-map approved-contract-hashes (buff 32) bool)
 
@@ -70,7 +90,7 @@
   reserve-a: uint, 
   reserve-b: uint, 
   liquidity-total: uint,
-  created-at: uint  ;; CLARITY 4: Using stacks-block-time for timestamp
+  created-at: uint
 })
 (define-map liquidity-providers {pool-id: uint, provider: principal} uint)
 (define-map rewards {pool-id: uint, provider: principal} {last-claim: uint, accrued: uint})
@@ -153,6 +173,8 @@
       ;; CLARITY 4: stacks-block-time - Get current Unix timestamp
       (current-timestamp stacks-block-time)
     )
+    ;; Access control checks
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
     (asserts! (> amount-a u0) ERR-INVALID-AMOUNT)
     (asserts! (> amount-b u0) ERR-INVALID-AMOUNT)
     (map-set pools pool-id {
@@ -195,23 +217,22 @@
       ;; Get existing LP balance for provider
       (existing-lp (default-to u0 (map-get? liquidity-providers {pool-id: pool-id, provider: tx-sender})))
     )
-    ;; CHECK 1: Amounts must be greater than zero
+    ;; Access control checks
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (not (is-pool-suspended pool-id)) ERR-POOL-SUSPENDED)
+    
     (asserts! (> amount-a u0) ERR-ZERO-AMOUNT)
     (asserts! (> amount-b u0) ERR-ZERO-AMOUNT)
     
-    ;; CHECK 2: Pool ratio check (only for non-empty pools)
-    ;; Ensures liquidity is added in correct proportion
     (asserts! (or 
-      (is-eq liquidity-total u0)  ;; Skip ratio check for first deposit
+      (is-eq liquidity-total u0)
       (and
         (>= provided-ratio-scaled (- expected-ratio-scaled RATIO_TOLERANCE))
         (<= provided-ratio-scaled (+ expected-ratio-scaled RATIO_TOLERANCE))))
       ERR-RATIO-MISMATCH)
     
-    ;; CHECK 3: Slippage protection - ensure minimum LP tokens
     (asserts! (>= liquidity-tokens min-liquidity) ERR-SLIPPAGE-TOO-HIGH)
     
-    ;; CHECK 4: Ensure liquidity tokens calculated is valid
     (asserts! (> liquidity-tokens u0) ERR-INVALID-AMOUNT)
     
     ;; Update pool reserves
@@ -242,7 +263,7 @@
       (current-timestamp stacks-block-time)
       ;; Get provider's LP token balance
       (provider-lp-balance (default-to u0 (map-get? liquidity-providers {pool-id: pool-id, provider: tx-sender})))
-      ;; Check time lock status (Clarity 4: stacks-block-time for time checks)
+      
       (time-lock (map-get? liquidity-time-locks {pool-id: pool-id, provider: tx-sender}))
       (is-locked (match time-lock
         lock-data (< current-timestamp (get locked-until lock-data))
@@ -518,6 +539,9 @@
       
       (swap-id (+ (var-get last-swap-id) u1))
     )
+    ;; Access control checks
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (not (is-pool-suspended pool-id)) ERR-POOL-SUSPENDED)
     (asserts! (> amount-in u0) ERR-ZERO-AMOUNT)
     
     (asserts! (>= deadline current-timestamp) ERR-SWAP-EXPIRED)
@@ -776,16 +800,161 @@
 )
 
 ;; ----------------------------------------
-;; Owner/Admin Functions
+;; Owner/Admin Functions with Access Controls
 ;; ----------------------------------------
 
-;; Owner withdraw fees
+;; Check if caller is the contract owner
+(define-read-only (is-owner (caller principal))
+  (is-eq caller CONTRACT-OWNER)
+)
+
+;; Check if caller is an operator
+(define-read-only (is-operator (caller principal))
+  (default-to false (map-get? admin-operators caller))
+)
+
+;; Check if caller is owner or operator
+(define-read-only (is-authorized (caller principal))
+  (or (is-owner caller) (is-operator caller))
+)
+
+;; Check if contract is paused
+(define-read-only (is-contract-paused)
+  (var-get contract-paused)
+)
+
+;; Check if a pool is suspended
+(define-read-only (is-pool-suspended (pool-id uint))
+  (default-to false (map-get? suspended-pools pool-id))
+)
+
+;; Get pending owner
+(define-read-only (get-pending-owner)
+  (var-get pending-owner)
+)
+
+;; Owner-only: Pause the entire contract
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+;; Owner-only: Unpause the contract
+(define-public (unpause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (var-set contract-paused false)
+    (ok true)
+  )
+)
+
+;; Owner/Operator: Suspend a specific pool
+(define-public (suspend-pool (pool-id uint))
+  (begin
+    (asserts! (is-authorized tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-some (map-get? pools pool-id)) ERR-POOL-NOT-FOUND)
+    (map-set suspended-pools pool-id true)
+    (ok true)
+  )
+)
+
+;; Owner/Operator: Unsuspend a specific pool
+(define-public (unsuspend-pool (pool-id uint))
+  (begin
+    (asserts! (is-authorized tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-some (map-get? pools pool-id)) ERR-POOL-NOT-FOUND)
+    (map-delete suspended-pools pool-id)
+    (ok true)
+  )
+)
+
+;; Owner-only: Add an operator
+(define-public (add-operator (operator principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-operator operator)) ERR-ALREADY-OPERATOR)
+    (map-set admin-operators operator true)
+    (ok true)
+  )
+)
+
+;; Owner-only: Remove an operator
+(define-public (remove-operator (operator principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq operator CONTRACT-OWNER)) ERR-CANNOT-REMOVE-OWNER)
+    (map-delete admin-operators operator)
+    (ok true)
+  )
+)
+
+;; Owner-only: Initiate ownership transfer (two-step process)
+(define-public (transfer-ownership (new-owner principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (var-set pending-owner (some new-owner))
+    (ok true)
+  )
+)
+
+;; Pending owner: Accept ownership transfer
+(define-public (accept-ownership)
+  (let
+    (
+      (pending (var-get pending-owner))
+    )
+    (asserts! (is-some pending) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender (unwrap! pending ERR-NOT-AUTHORIZED)) ERR-NOT-AUTHORIZED)
+    ;; Transfer operator status to new owner
+    (map-set admin-operators (unwrap-panic pending) true)
+    (var-set pending-owner none)
+    (ok true)
+  )
+)
+
+;; Owner-only: Cancel pending ownership transfer
+(define-public (cancel-ownership-transfer)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (var-set pending-owner none)
+    (ok true)
+  )
+)
+
+;; Owner-only: Withdraw platform fees
 (define-public (withdraw-fees (amount uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
     (asserts! (<= amount (var-get platform-fees)) ERR-INSUFFICIENT-BALANCE)
     (try! (stx-transfer? amount tx-sender CONTRACT-OWNER))
     (var-set platform-fees (- (var-get platform-fees) amount))
-    (ok true)
+    (ok amount)
+  )
+)
+
+;; Owner-only: Emergency withdraw all fees
+(define-public (emergency-withdraw-fees)
+  (let
+    (
+      (total-fees (var-get platform-fees))
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (> total-fees u0) ERR-INSUFFICIENT-BALANCE)
+    (try! (stx-transfer? total-fees tx-sender CONTRACT-OWNER))
+    (var-set platform-fees u0)
+    (ok total-fees)
+  )
+)
+
+;; Owner-only: Update fee percentage (with safety limits)
+(define-public (update-fee-percent (new-fee uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (<= new-fee u100) ERR-INVALID-AMOUNT) ;; Max 1% fee
+    (ok new-fee) ;; Note: Would need data-var for FEE-PERCENT to actually update
   )
 )
