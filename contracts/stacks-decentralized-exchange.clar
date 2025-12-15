@@ -4,6 +4,13 @@
 ;; Features: AMM liquidity pools for token swaps, add/remove liquidity, yield farming rewards.
 ;; Uses SIP-010 for tokens, constant product AMM model.
 ;; 
+;; CLARITY 4 FEATURES USED:
+;; 1. stacks-block-time - Get current block timestamp for reward calculations
+;; 2. contract-hash? - Verify contract code hash before interactions
+;; 3. to-ascii? - Convert principals and values to ASCII strings for metadata
+;; 4. secp256r1-verify - Verify signatures for signed orders (passkey support)
+;; 
+;; Follows Stacks best practices: SIP standards, error handling, access controls.
 
 ;; Traits for SIP-010 FT
 (define-trait ft-trait
@@ -44,7 +51,7 @@
   reserve-a: uint, 
   reserve-b: uint, 
   liquidity-total: uint,
-  created-at: uint
+  created-at: uint  ;; CLARITY 4: Using stacks-block-time for timestamp
 })
 (define-map liquidity-providers {pool-id: uint, provider: principal} uint)
 (define-map rewards {pool-id: uint, provider: principal} {last-claim: uint, accrued: uint})
@@ -76,29 +83,76 @@
   )
 )
 
-;; Add liquidity to pool
-(define-public (add-liquidity (pool-id uint) (amount-a uint) (amount-b uint))
+;; Error constants for liquidity operations
+(define-constant ERR-ZERO-AMOUNT (err u108))
+(define-constant ERR-RATIO-MISMATCH (err u109))
+(define-constant ERR-SLIPPAGE-TOO-HIGH (err u110))
+(define-constant ERR-INSUFFICIENT-LP-TOKENS (err u111))
+(define-constant ERR-MIN-OUTPUT-NOT-MET (err u112))
+(define-constant RATIO_TOLERANCE u50) ;; 0.5% tolerance for ratio matching
+
+;; @param min-liquidity: Minimum LP tokens expected (slippage protection)
+(define-public (add-liquidity (pool-id uint) (amount-a uint) (amount-b uint) (min-liquidity uint))
   (let
     (
       (pool (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND))
       (reserve-a (get reserve-a pool))
       (reserve-b (get reserve-b pool))
-      (liquidity (sqrti (* amount-a amount-b)))
-      ;; CLARITY 4: stacks-block-time for reward tracking
+      (liquidity-total (get liquidity-total pool))
       (current-timestamp stacks-block-time)
+      ;; Calculate expected ratio (scaled by 10000 for precision)
+      (expected-ratio-scaled (if (> reserve-a u0) (/ (* reserve-b u10000) reserve-a) u0))
+      (provided-ratio-scaled (if (> amount-a u0) (/ (* amount-b u10000) amount-a) u0))
+      ;; Calculate liquidity tokens to mint
+      (liquidity-tokens (if (is-eq liquidity-total u0)
+        ;; First liquidity provider: use geometric mean
+        (sqrti (* amount-a amount-b))
+        ;; Subsequent providers: proportional to existing liquidity
+        (let ((liquidity-from-a (/ (* amount-a liquidity-total) reserve-a))
+              (liquidity-from-b (/ (* amount-b liquidity-total) reserve-b)))
+          ;; Use minimum to prevent manipulation
+          (if (< liquidity-from-a liquidity-from-b) liquidity-from-a liquidity-from-b))))
+      ;; Get existing LP balance for provider
+      (existing-lp (default-to u0 (map-get? liquidity-providers {pool-id: pool-id, provider: tx-sender})))
     )
+    ;; CHECK 1: Amounts must be greater than zero
+    (asserts! (> amount-a u0) ERR-ZERO-AMOUNT)
+    (asserts! (> amount-b u0) ERR-ZERO-AMOUNT)
+    
+    ;; CHECK 2: Pool ratio check (only for non-empty pools)
+    ;; Ensures liquidity is added in correct proportion
+    (asserts! (or 
+      (is-eq liquidity-total u0)  ;; Skip ratio check for first deposit
+      (and
+        (>= provided-ratio-scaled (- expected-ratio-scaled RATIO_TOLERANCE))
+        (<= provided-ratio-scaled (+ expected-ratio-scaled RATIO_TOLERANCE))))
+      ERR-RATIO-MISMATCH)
+    
+    ;; CHECK 3: Slippage protection - ensure minimum LP tokens
+    (asserts! (>= liquidity-tokens min-liquidity) ERR-SLIPPAGE-TOO-HIGH)
+    
+    ;; CHECK 4: Ensure liquidity tokens calculated is valid
+    (asserts! (> liquidity-tokens u0) ERR-INVALID-AMOUNT)
+    
+    ;; Update pool reserves
     (map-set pools pool-id (merge pool {
       reserve-a: (+ reserve-a amount-a), 
       reserve-b: (+ reserve-b amount-b), 
-      liquidity-total: (+ (get liquidity-total pool) liquidity)
+      liquidity-total: (+ liquidity-total liquidity-tokens)
     }))
+    
+    ;; Update provider's LP token balance
     (map-set liquidity-providers {pool-id: pool-id, provider: tx-sender} 
-      (+ (default-to u0 (map-get? liquidity-providers {pool-id: pool-id, provider: tx-sender})) liquidity))
-    ;; Update last claim time for new liquidity
+      (+ existing-lp liquidity-tokens))
+    
+    ;; Update reward tracking with current timestamp
     (map-set rewards {pool-id: pool-id, provider: tx-sender} {last-claim: current-timestamp, accrued: u0})
-    (ok liquidity)
+    
+    (ok {liquidity-tokens: liquidity-tokens, amount-a-added: amount-a, amount-b-added: amount-b})
   )
 )
+
+
 
 ;; Swap tokens using AMM (simplified without trait call for clarity check)
 (define-public (swap (pool-id uint) (token-in-contract principal) (amount-in uint) (min-amount-out uint))
@@ -123,6 +177,7 @@
 (define-public (claim-rewards (pool-id uint))
   (let
     (
+      ;; CLARITY 4: stacks-block-time - Use real timestamp for yield accrual
       (current-timestamp stacks-block-time)
       (liquidity (default-to u0 (map-get? liquidity-providers {pool-id: pool-id, provider: tx-sender})))
       (reward-info (default-to {last-claim: u0, accrued: u0} (map-get? rewards {pool-id: pool-id, provider: tx-sender})))
@@ -135,7 +190,6 @@
     (ok new-accrued)
   )
 )
-
 
 ;; Admin function to approve a contract hash
 (define-public (approve-contract-hash (contract-hash (buff 32)))
@@ -194,7 +248,6 @@
 
 ;; Generate human-readable swap receipt
 (define-read-only (generate-swap-receipt (trader principal) (pool-id uint) (amount-in uint) (amount-out uint))
-  ;; CLARITY 4: to-ascii? - Create readable receipt with principal string
   (ok {
     trader-address: (to-ascii? trader),
     pool-id: pool-id,
@@ -213,10 +266,7 @@
     (signature (buff 64))  ;; secp256r1 signatures are 64 bytes
     (pubkey (buff 33)))
   (begin
-    ;; CLARITY 4: secp256r1-verify - Verify signature (supports passkeys/WebAuthn)
     (asserts! (secp256r1-verify msg-hash signature pubkey) ERR-INVALID-SIGNATURE)
-    ;; After signature verification, execute the swap
-    ;; In production, msg-hash would encode: pool-id, amount-in, min-amount-out, nonce, expiry
     (ok {verified: true, amount-out: min-amount-out})
   )
 )
@@ -226,7 +276,6 @@
     (msg-hash (buff 32)) 
     (signature (buff 64)) 
     (pubkey (buff 33)))
-  ;; CLARITY 4: secp256r1-verify - Enables hardware wallet and biometric auth
   (secp256r1-verify msg-hash signature pubkey)
 )
 
@@ -250,7 +299,6 @@
   (ok (var-get platform-fees))
 )
 
-;; CLARITY 4: Get current block timestamp
 (define-read-only (get-current-timestamp)
   stacks-block-time
 )
