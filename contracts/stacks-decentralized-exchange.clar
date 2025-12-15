@@ -3,13 +3,6 @@
 ;; Decentralized Exchange (DEX) on Stacks
 ;; Features: AMM liquidity pools for token swaps, add/remove liquidity, yield farming rewards.
 ;; Uses SIP-010 for tokens, constant product AMM model.
-;; 
-;; CLARITY 4 FEATURES USED:
-;; 1. stacks-block-time - Get current block timestamp for reward calculations
-;; 2. contract-hash? - Verify contract code hash before interactions
-;; 3. to-ascii? - Convert principals and values to ASCII strings for metadata
-;; 4. secp256r1-verify - Verify signatures for signed orders (passkey support)
-;; 
 ;; Follows Stacks best practices: SIP standards, error handling, access controls.
 
 ;; Traits for SIP-010 FT
@@ -36,6 +29,14 @@
 (define-constant ERR-INVALID-CONTRACT-HASH (err u107))
 (define-constant FEE-PERCENT u30) ;; 0.3% fee in basis points
 (define-constant REWARD_RATE u10) ;; Rewards per second per liquidity unit
+
+;; Error constants for liquidity operations
+(define-constant ERR-ZERO-AMOUNT (err u108))
+(define-constant ERR-RATIO-MISMATCH (err u109))
+(define-constant ERR-SLIPPAGE-TOO-HIGH (err u110))
+(define-constant ERR-INSUFFICIENT-LP-TOKENS (err u111))
+(define-constant ERR-MIN-OUTPUT-NOT-MET (err u112))
+(define-constant RATIO_TOLERANCE u50) ;; 0.5% tolerance for ratio matching
 
 ;; Error constants for swap operations
 (define-constant ERR-SWAP-EXPIRED (err u113))
@@ -90,14 +91,6 @@
     (ok pool-id)
   )
 )
-
-;; Error constants for liquidity operations
-(define-constant ERR-ZERO-AMOUNT (err u108))
-(define-constant ERR-RATIO-MISMATCH (err u109))
-(define-constant ERR-SLIPPAGE-TOO-HIGH (err u110))
-(define-constant ERR-INSUFFICIENT-LP-TOKENS (err u111))
-(define-constant ERR-MIN-OUTPUT-NOT-MET (err u112))
-(define-constant RATIO_TOLERANCE u50) ;; 0.5% tolerance for ratio matching
 
 ;; @param min-liquidity: Minimum LP tokens expected (slippage protection)
 (define-public (add-liquidity (pool-id uint) (amount-a uint) (amount-b uint) (min-liquidity uint))
@@ -178,20 +171,15 @@
       (seconds-since-claim (- current-timestamp (get last-claim reward-info)))
       (pending-rewards (+ (get accrued reward-info) (* provider-lp-balance (* REWARD_RATE seconds-since-claim))))
     )
-    ;; CHECK 1: LP tokens to remove must be greater than zero
     (asserts! (> lp-tokens u0) ERR-ZERO-AMOUNT)
     
-    ;; CHECK 2: Provider must have sufficient LP tokens
     (asserts! (>= provider-lp-balance lp-tokens) ERR-INSUFFICIENT-LP-TOKENS)
     
-    ;; CHECK 3: Pool must have sufficient liquidity
     (asserts! (>= liquidity-total lp-tokens) ERR-INSUFFICIENT-LIQUIDITY)
     
-    ;; CHECK 4: Output amounts must be valid
     (asserts! (> amount-a-out u0) ERR-INVALID-AMOUNT)
     (asserts! (> amount-b-out u0) ERR-INVALID-AMOUNT)
     
-    ;; CHECK 5: Slippage protection - minimum output amounts
     (asserts! (>= amount-a-out min-amount-a) ERR-MIN-OUTPUT-NOT-MET)
     (asserts! (>= amount-b-out min-amount-b) ERR-MIN-OUTPUT-NOT-MET)
     
@@ -232,7 +220,7 @@
 })
 (define-data-var last-swap-id uint u0)
 
-;; Calculate output amount for a swap (read-only helper)
+;; Calculate output amount for a swap (read-only helper function)
 (define-read-only (get-swap-output (pool-id uint) (token-in-contract principal) (amount-in uint))
   (let
     (
