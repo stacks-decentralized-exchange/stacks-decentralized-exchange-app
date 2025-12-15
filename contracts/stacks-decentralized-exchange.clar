@@ -152,7 +152,63 @@
   )
 )
 
-
+(define-public (remove-liquidity (pool-id uint) (lp-tokens uint) (min-amount-a uint) (min-amount-b uint))
+  (let
+    (
+      (pool (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND))
+      (reserve-a (get reserve-a pool))
+      (reserve-b (get reserve-b pool))
+      (liquidity-total (get liquidity-total pool))
+      (current-timestamp stacks-block-time)
+      ;; Get provider's LP token balance
+      (provider-lp-balance (default-to u0 (map-get? liquidity-providers {pool-id: pool-id, provider: tx-sender})))
+      ;; Calculate proportional amounts to return
+      (amount-a-out (/ (* lp-tokens reserve-a) liquidity-total))
+      (amount-b-out (/ (* lp-tokens reserve-b) liquidity-total))
+      ;; Calculate pending rewards before removal
+      (reward-info (default-to {last-claim: u0, accrued: u0} (map-get? rewards {pool-id: pool-id, provider: tx-sender})))
+      (seconds-since-claim (- current-timestamp (get last-claim reward-info)))
+      (pending-rewards (+ (get accrued reward-info) (* provider-lp-balance (* REWARD_RATE seconds-since-claim))))
+    )
+    ;; CHECK 1: LP tokens to remove must be greater than zero
+    (asserts! (> lp-tokens u0) ERR-ZERO-AMOUNT)
+    
+    ;; CHECK 2: Provider must have sufficient LP tokens
+    (asserts! (>= provider-lp-balance lp-tokens) ERR-INSUFFICIENT-LP-TOKENS)
+    
+    ;; CHECK 3: Pool must have sufficient liquidity
+    (asserts! (>= liquidity-total lp-tokens) ERR-INSUFFICIENT-LIQUIDITY)
+    
+    ;; CHECK 4: Output amounts must be valid
+    (asserts! (> amount-a-out u0) ERR-INVALID-AMOUNT)
+    (asserts! (> amount-b-out u0) ERR-INVALID-AMOUNT)
+    
+    ;; CHECK 5: Slippage protection - minimum output amounts
+    (asserts! (>= amount-a-out min-amount-a) ERR-MIN-OUTPUT-NOT-MET)
+    (asserts! (>= amount-b-out min-amount-b) ERR-MIN-OUTPUT-NOT-MET)
+    
+    ;; Update pool reserves
+    (map-set pools pool-id (merge pool {
+      reserve-a: (- reserve-a amount-a-out), 
+      reserve-b: (- reserve-b amount-b-out), 
+      liquidity-total: (- liquidity-total lp-tokens)
+    }))
+    
+    ;; Update provider's LP token balance
+    (map-set liquidity-providers {pool-id: pool-id, provider: tx-sender} 
+      (- provider-lp-balance lp-tokens))
+    
+    ;; Reset rewards tracking (rewards should be claimed before removal)
+    (map-set rewards {pool-id: pool-id, provider: tx-sender} {last-claim: current-timestamp, accrued: u0})
+    
+    (ok {
+      amount-a: amount-a-out, 
+      amount-b: amount-b-out, 
+      lp-tokens-burned: lp-tokens,
+      pending-rewards: pending-rewards
+    })
+  )
+)
 
 ;; Swap tokens using AMM (simplified without trait call for clarity check)
 (define-public (swap (pool-id uint) (token-in-contract principal) (amount-in uint) (min-amount-out uint))
