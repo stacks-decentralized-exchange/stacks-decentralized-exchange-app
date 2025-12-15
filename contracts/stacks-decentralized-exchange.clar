@@ -288,7 +288,7 @@
   )
 )
 
-;; Add liquidity with time lock for enhanced rewards (Clarity 4: stacks-block-time)
+;; Add liquidity with time lock for enhanced rewards
 (define-public (add-liquidity-with-lock (pool-id uint) (amount-a uint) (amount-b uint) (min-liquidity uint) (lock-period uint))
   (let
     (
@@ -344,7 +344,7 @@
     (map-set liquidity-providers {pool-id: pool-id, provider: tx-sender} 
       (+ existing-lp liquidity-tokens))
     
-    ;; Set time lock (Clarity 4: stacks-block-time for lock expiry)
+    ;; Set time lock
     (map-set liquidity-time-locks {pool-id: pool-id, provider: tx-sender} {
       locked-until: lock-expiry,
       lock-block-height: current-block
@@ -619,12 +619,12 @@
     ;; match on result type: (match result ok-name ok-expr err-name err-expr)
     (match hash-result
       hash-value (default-to false (map-get? approved-contract-hashes hash-value))
-      err-val false  ;; if error (contract doesn't exist)
+      err-val false
     )
   )
 )
 
-;; Swap with contract verification (CLARITY 4: contract-hash?)
+;; Swap with contract verification
 (define-public (verified-swap (pool-id uint) (token-in-contract principal) (amount-in uint) (min-amount-out uint))
   (let
     (
